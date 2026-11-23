@@ -1,0 +1,14 @@
+services:
+  census:
+    build: .
+    image: census-archive:latest
+    ports:
+      - "${CENSUS_PORT:-8000}:8000"
+    environment:
+      CENSUS_DB: /data/archive.sqlite3
+    volumes:
+      - census-data:/data
+    restart: unless-stopped
+
+volumes:
+  census-data:
