@@ -6,9 +6,10 @@ Endpoints
 ``GET  /archive/{period}``   batch metadata
 ``POST /census/query``       minimal-read expression + union population
 
-The census endpoint works in two clearly separated phases inside one SQLite
-read snapshot: first derive the expression from the period's catalog only, then
-read headcounts for exactly the cells that appear in the expression.
+The census endpoint works inside one SQLite read snapshot: it first checks
+the batch's saved consistency conclusion (verifying legacy batches lazily on
+first read), then derives the expression from the period's catalog only, and
+finally reads headcounts for exactly the cells that appear in the expression.
 """
 
 from __future__ import annotations
@@ -24,12 +25,15 @@ from pydantic import BaseModel, Field, field_validator
 from .archive import (
     Archive,
     BatchConflict,
+    InconsistentBatch,
     InvalidBatch,
     MissingCells,
     UnknownPeriod,
+    VerificationRecord,
     validate_cell,
 )
 from .solver import MAX_DEPTH, analyze
+from .verify import conflict_to_dict, find_conflicts
 
 MAX_CELLS_PER_REQUEST = 100_000
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "archive.sqlite3"
@@ -124,6 +128,20 @@ class MissingArchiveResponse(BaseModel):
     truncated: bool = False
 
 
+class ConflictModel(BaseModel):
+    ancestor: str
+    ancestor_population: int
+    cells: List[str]
+    descendant_total: int
+    kind: str
+
+
+class BatchConflictsResponse(BaseModel):
+    detail: str
+    period: str
+    conflicts: List[ConflictModel]
+
+
 app = FastAPI(
     title="Census Archive Service",
     description=(
@@ -176,6 +194,20 @@ def submit_batch(
             status_code=409,
             detail=f"{exc}; pass replace=true to replace it atomically",
         ) from exc
+    except InconsistentBatch as exc:
+        # The submission contradicts itself; the stored batch and its saved
+        # verification conclusion are left untouched.
+        return JSONResponse(
+            status_code=422,
+            content=BatchConflictsResponse(
+                detail=str(exc),
+                period=exc.period,
+                conflicts=[
+                    ConflictModel(**conflict_to_dict(conflict))
+                    for conflict in exc.conflicts
+                ],
+            ).model_dump(),
+        )
     except InvalidBatch as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return BatchResponse(
@@ -205,6 +237,23 @@ def query_census(
     archive: Archive = Depends(get_archive),
 ) -> CensusResponse:
     with archive.snapshot(request.period) as snapshot:
+        record = snapshot.verification()
+        if record is None:
+            # A batch stored before consistency checks existed: verify it now
+            # from this snapshot and save the conclusion under its batch id.
+            # The read snapshot does not block a concurrent replacement, and
+            # the conclusion is keyed by batch id, so this late verification
+            # can never overwrite a newer batch's conclusion.
+            record = archive.record_verification(
+                snapshot.batch_id,
+                request.period,
+                find_conflicts(snapshot.all_populations()),
+            )
+        if record.status == "conflict":
+            # A bad archive only reports its conflicts until a consistent
+            # batch replaces it.
+            return _conflict_response(request.period, record)
+
         # Phase 1: derive the minimal expression from the catalog alone.  No
         # headcount is read and no finest cell is enumerated.
         try:
@@ -229,6 +278,24 @@ def query_census(
         ],
         retrieved_cells=solution.retrieved_cells,
         total_population=total,
+    )
+
+
+def _conflict_response(period: str, record: VerificationRecord) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content=BatchConflictsResponse(
+            detail=(
+                "the archived batch for this period failed consistency "
+                "verification; replace it with a consistent batch to resume "
+                "queries"
+            ),
+            period=period,
+            conflicts=[
+                ConflictModel(**conflict_to_dict(conflict))
+                for conflict in record.conflicts
+            ],
+        ).model_dump(),
     )
 
 
